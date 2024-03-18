@@ -20,6 +20,7 @@ from music_assistant.common.models.config_entries import (
 from music_assistant.common.models.enums import (
     ConfigEntryType,
     ContentType,
+    MediaType,
     PlayerFeature,
     PlayerState,
     PlayerType,
@@ -28,7 +29,10 @@ from music_assistant.common.models.enums import (
 from music_assistant.common.models.errors import SetupFailedError
 from music_assistant.common.models.media_items import AudioFormat
 from music_assistant.common.models.player import DeviceInfo, Player
+from music_assistant.server.helpers.audio import get_media_stream
+from music_assistant.server.helpers.process import AsyncProcess, check_output
 from music_assistant.server.models.player_provider import PlayerProvider
+from music_assistant.server.providers.ugp import UGP_PREFIX
 
 if TYPE_CHECKING:
     from snapcast.control.group import Snapgroup
@@ -39,17 +43,18 @@ if TYPE_CHECKING:
     from music_assistant.common.models.provider import ProviderManifest
     from music_assistant.common.models.queue_item import QueueItem
     from music_assistant.server import MusicAssistant
-    from music_assistant.server.controllers.streams import MultiClientStreamJob
     from music_assistant.server.models import ProviderInstanceType
 
-CONF_SNAPCAST_SERVER_HOST = "snapcast_server_host"
-CONF_SNAPCAST_SERVER_CONTROL_PORT = "snapcast_server_control_port"
+CONF_SERVER_HOST = "snapcast_server_host"
+CONF_SERVER_CONTROL_PORT = "snapcast_server_control_port"
+CONF_USE_EXTERNAL_SERVER = "snapcast_use_external_server"
 
 SNAP_STREAM_STATUS_MAP = {
     "idle": PlayerState.IDLE,
     "playing": PlayerState.PLAYING,
     "unknown": PlayerState.IDLE,
 }
+DEFAULT_SNAPSERVER_PORT = 1705
 
 
 async def setup(
@@ -62,10 +67,10 @@ async def setup(
 
 
 async def get_config_entries(
-    mass: MusicAssistant,
-    instance_id: str | None = None,
-    action: str | None = None,
-    values: dict[str, ConfigValueType] | None = None,
+    mass: MusicAssistant,  # noqa: ARG001
+    instance_id: str | None = None,  # noqa: ARG001
+    action: str | None = None,  # noqa: ARG001
+    values: dict[str, ConfigValueType] | None = None,  # noqa: ARG001
 ) -> tuple[ConfigEntry, ...]:
     """
     Return Config entries to setup this provider.
@@ -74,21 +79,37 @@ async def get_config_entries(
     action: [optional] action key called from config entries UI.
     values: the (intermediate) raw values for config entries sent with the action.
     """
-    # ruff: noqa: ARG001
+    returncode, output = await check_output("snapserver -v")
+    snapserver_present = returncode == 0 and "snapserver v0.27.0" in output.decode()
     return (
         ConfigEntry(
-            key=CONF_SNAPCAST_SERVER_HOST,
+            key=CONF_USE_EXTERNAL_SERVER,
+            type=ConfigEntryType.BOOLEAN,
+            default_value=not snapserver_present,
+            label="Use existing Snapserver",
+            required=False,
+            description="Music Assistant by default already includes a Snapserver. \n\n"
+            "Checking this option allows you to connect to your own/external existing Snapserver "
+            "and not use the builtin one provided by Music Assistant.",
+            advanced=snapserver_present,
+        ),
+        ConfigEntry(
+            key=CONF_SERVER_HOST,
             type=ConfigEntryType.STRING,
             default_value="127.0.0.1",
             label="Snapcast server ip",
-            required=True,
+            required=False,
+            depends_on=CONF_USE_EXTERNAL_SERVER,
+            advanced=snapserver_present,
         ),
         ConfigEntry(
-            key=CONF_SNAPCAST_SERVER_CONTROL_PORT,
+            key=CONF_SERVER_CONTROL_PORT,
             type=ConfigEntryType.INTEGER,
-            default_value="1705",
+            default_value=DEFAULT_SNAPSERVER_PORT,
             label="Snapcast control port",
-            required=True,
+            required=False,
+            depends_on=CONF_USE_EXTERNAL_SERVER,
+            advanced=snapserver_present,
         ),
     )
 
@@ -97,9 +118,12 @@ class SnapCastProvider(PlayerProvider):
     """Player provider for Snapcast based players."""
 
     _snapserver: Snapserver
-    snapcast_server_host: str
-    snapcast_server_control_port: int
+    _snapcast_server_host: str
+    _snapcast_server_control_port: int
     _stream_tasks: dict[str, asyncio.Task]
+    _use_builtin_server: bool
+    _snapserver_runner: asyncio.Task | None
+    _snapserver_started = asyncio.Event | None
 
     @property
     def supported_features(self) -> tuple[ProviderFeature, ...]:
@@ -108,20 +132,29 @@ class SnapCastProvider(PlayerProvider):
 
     async def handle_async_init(self) -> None:
         """Handle async initialization of the provider."""
-        self.snapcast_server_host = self.config.get_value(CONF_SNAPCAST_SERVER_HOST)
-        self.snapcast_server_control_port = self.config.get_value(CONF_SNAPCAST_SERVER_CONTROL_PORT)
+        self._snapcast_server_host = self.config.get_value(CONF_SERVER_HOST)
+        self._snapcast_server_control_port = self.config.get_value(CONF_SERVER_CONTROL_PORT)
+        self._use_builtin_server = not self.config.get_value(CONF_USE_EXTERNAL_SERVER)
         self._stream_tasks = {}
+        if self._use_builtin_server:
+            # start our own builtin snapserver
+            self._snapserver_started = asyncio.Event()
+            self._snapserver_runner = asyncio.create_task(self._builtin_server_runner())
+            await asyncio.wait_for(self._snapserver_started.wait(), 10)
+        else:
+            self._snapserver_runner = None
+            self._snapserver_started = None
         try:
             self._snapserver = await create_server(
                 self.mass.loop,
-                self.snapcast_server_host,
-                port=self.snapcast_server_control_port,
+                self._snapcast_server_host,
+                port=self._snapcast_server_control_port,
                 reconnect=True,
             )
             self._snapserver.set_on_update_callback(self._handle_update)
             self.logger.info(
-                f"Started Snapserver connection on:"
-                f"{self.snapcast_server_host}:{self.snapcast_server_control_port}"
+                "Started connection to Snapserver %s",
+                f"{self._snapcast_server_host}:{self._snapcast_server_control_port}",
             )
         except OSError as err:
             msg = "Unable to start the Snapserver connection ?"
@@ -137,6 +170,10 @@ class SnapCastProvider(PlayerProvider):
         for client in self._snapserver.clients:
             await self.cmd_stop(client.identifier)
         await self._snapserver.stop()
+        self._snapserver_started.clear()
+        if self._snapserver_runner and not self._snapserver_runner.done():
+            self._snapserver_runner.cancel()
+        await asyncio.sleep(2)  # prevent race conditions when reloading
 
     def _handle_update(self) -> None:
         """Process Snapcast init Player/Group and set callback ."""
@@ -240,23 +277,8 @@ class SnapCastProvider(PlayerProvider):
         await self._get_snapgroup(player_id).set_stream("default")
         self._handle_update()
 
-    async def play_media(
-        self,
-        player_id: str,
-        queue_item: QueueItem,
-        seek_position: int,
-        fade_in: bool,
-    ) -> None:
-        """Handle PLAY MEDIA on given player.
-
-        This is called by the Queue controller to start playing a queue item on the given player.
-        The provider's own implementation should work out how to handle this request.
-
-            - player_id: player_id of the player to handle the command.
-            - queue_item: The QueueItem that needs to be played on the player.
-            - seek_position: Optional seek to this position.
-            - fade_in: Optionally fade in the item at playback start.
-        """
+    async def play_media(self, player_id: str, queue_item: QueueItem) -> None:
+        """Handle PLAY MEDIA on given player."""
         player = self.mass.players.get(player_id)
         if player.synced_to:
             msg = "A synced player cannot receive play commands directly"
@@ -268,8 +290,39 @@ class SnapCastProvider(PlayerProvider):
         snap_group = self._get_snapgroup(player_id)
         await snap_group.set_stream(stream.identifier)
 
+        # TODO: can we handle 24 bits bit depth ?
+        pcm_format = AudioFormat(
+            content_type=ContentType.PCM_S16LE,
+            sample_rate=48000,
+            bit_depth=16,
+            channels=2,
+        )
+        if queue_item.media_type == MediaType.ANNOUNCEMENT:
+            # stream announcement url directly
+            audio_iterator = get_media_stream(
+                self.mass, queue_item.streamdetails, pcm_format=pcm_format
+            )
+        elif (
+            queue_item.queue_id.startswith(UGP_PREFIX)
+            and (stream_job := self.mass.streams.multi_client_jobs.get(queue_item.queue_id))
+            and stream_job.pending
+        ):
+            # handle special case for UGP multi client stream
+            stream_job = self.mass.streams.multi_client_jobs.get(queue_item.queue_id)
+            stream_job.expected_players.add(player_id)
+            audio_iterator = stream_job.subscribe(
+                player_id=player_id,
+                output_format=pcm_format,
+            )
+        else:
+            audio_iterator = self.mass.streams.get_flow_stream(
+                queue,
+                start_queue_item=queue_item,
+                pcm_format=pcm_format,
+            )
+
         async def _streamer() -> None:
-            host = self.snapcast_server_host
+            host = self._snapcast_server_host
             _, writer = await asyncio.open_connection(host, port)
             self.logger.debug("Opened connection to %s:%s", host, port)
             player.current_item_id = f"{queue_item.queue_id}.{queue_item.queue_item_id}"
@@ -278,71 +331,8 @@ class SnapCastProvider(PlayerProvider):
             player.state = PlayerState.PLAYING
             self._set_childs_state(player_id, PlayerState.PLAYING)
             self.mass.players.register_or_update(player)
-            # TODO: can we handle 24 bits bit depth ?
-            pcm_format = AudioFormat(
-                content_type=ContentType.PCM_S16LE,
-                sample_rate=48000,
-                bit_depth=16,
-                channels=2,
-            )
             try:
-                async for pcm_chunk in self.mass.streams.get_flow_stream(
-                    queue,
-                    start_queue_item=queue_item,
-                    pcm_format=pcm_format,
-                    seek_position=seek_position,
-                    fade_in=fade_in,
-                ):
-                    writer.write(pcm_chunk)
-                    await writer.drain()
-                # end of the stream reached
-                if writer.can_write_eof():
-                    writer.write_eof()
-                    await writer.drain()
-                # we need to wait a bit before removing the stream to ensure
-                # that all snapclients have consumed the audio
-                # https://github.com/music-assistant/hass-music-assistant/issues/1962
-                await asyncio.sleep(30)
-            finally:
-                if not writer.is_closing():
-                    writer.close()
-                await self._snapserver.stream_remove_stream(stream.identifier)
-                self.logger.debug("Closed connection to %s:%s", host, port)
-
-        # start streaming the queue (pcm) audio in a background task
-        self._stream_tasks[player_id] = asyncio.create_task(_streamer())
-
-    async def play_stream(self, player_id: str, stream_job: MultiClientStreamJob) -> None:
-        """Handle PLAY STREAM on given player.
-
-        This is a special feature from the Universal Group provider.
-        """
-        player = self.mass.players.get(player_id)
-        if player.synced_to:
-            msg = "A synced player cannot receive play commands directly"
-            raise RuntimeError(msg)
-        # stop any existing streams first
-        await self.cmd_stop(player_id)
-        if stream_job.pcm_format.bit_depth != 16 or stream_job.pcm_format.sample_rate != 48000:
-            # TODO: resample on the fly here ?
-            raise RuntimeError("Unsupported PCM format")
-        stream, port = await self._create_stream()
-        stream_job.expected_players.add(player_id)
-        snap_group = self._get_snapgroup(player_id)
-        await snap_group.set_stream(stream.identifier)
-
-        async def _streamer() -> None:
-            host = self.snapcast_server_host
-            _, writer = await asyncio.open_connection(host, port)
-            self.logger.debug("Opened connection to %s:%s", host, port)
-            player.current_item_id = f"flow/{stream_job.queue_id}"
-            player.elapsed_time = 0
-            player.elapsed_time_last_updated = time.time()
-            player.state = PlayerState.PLAYING
-            self._set_childs_state(player_id, PlayerState.PLAYING)
-            self.mass.players.register_or_update(player)
-            try:
-                async for pcm_chunk in stream_job.subscribe(player_id):
+                async for pcm_chunk in audio_iterator:
                     writer.write(pcm_chunk)
                     await writer.drain()
                 # end of the stream reached
@@ -419,3 +409,22 @@ class SnapCastProvider(PlayerProvider):
             player = self.mass.players.get(child_player_id)
             player.state = state
             self.mass.players.update(child_player_id)
+
+    async def _builtin_server_runner(self) -> None:
+        """Start running the builtin snapserver."""
+        if self._snapserver_started.is_set():
+            raise RuntimeError("Snapserver is already started!")
+        logger = self.logger.getChild("snapserver")
+        logger.info("Starting builtin Snapserver...")
+        async with AsyncProcess(
+            ["snapserver"], enable_stdin=False, enable_stdout=True, enable_stderr=False
+        ) as snapserver_proc:
+            # keep reading from stderr until exit
+            async for data in snapserver_proc.iter_any():
+                data = data.decode().strip()  # noqa: PLW2901
+                for line in data.split("\n"):
+                    logger.debug(line)
+                    if "(Snapserver) Version 0.27.0" in line:
+                        # delay init a small bit to prevent race conditions
+                        # where we try to connect too soon
+                        self.mass.loop.call_later(2, self._snapserver_started.set)
